@@ -1,0 +1,277 @@
+# Matches — флоу для фронта
+
+Дуэль по роадмапе: два игрока, N раундов (вопрос за вопросом), после каждого
+раунда — реавил правильного ответа, в конце — финальный результат с очками.
+
+## Константы
+
+- `ROUNDS_PER_MATCH` задаётся на бэке (сейчас 3), фронт не хардкодит число раундов —
+  всегда берёт `total_rounds` из ответа `GET /matches/{id}`.
+
+## Эндпоинты
+
+Все требуют `Authorization: Bearer <token>`.
+
+### `GET /matches/roadmaps`
+
+Вызывать перед экраном выбора роадмапы для боя — отдаёт все роадмапы с прогрессом
+текущего юзера и флагом, доступна ли роадмапа для матча (нужно 5+ пройденных
+юнитов).
+
+Ответ:
+```json
+[
+  { "id": "string", "title": "string", "completed_units": 7, "eligible": true },
+  { "id": "string", "title": "string", "completed_units": 2, "eligible": false }
+]
+```
+
+UI: показывать все роадмапы, недоступные (`eligible: false`) — с замочком/
+дизейблом и подписью вида "Пройдено 2/5 юнитов", доступные — кликабельны и ведут
+к `POST /matches/find` с этим `roadmap_id`.
+
+### `POST /matches/find`
+
+Запрос:
+```json
+{ "roadmap_id": "string" }
+```
+
+Ответ (union по полю `status`):
+```json
+// ещё нет соперника — встал в очередь ожидания
+{ "status": "waiting" }
+
+// соперник найден, матч создан
+{ "status": "matched", "match_id": "string" }
+```
+
+Ошибки:
+- `403 need_5_units_completed` — у игрока меньше 5 пройденных юнитов в этой роадмапе
+- `404 roadmap_not_found`
+- `409 not_enough_questions_for_match` — в пройденных юнитах слабого игрока не хватает вопросов
+
+### `GET /matches/{match_id}`
+
+Главный опрашиваемый эндпоинт. Дергать каждые **1.5–2 секунды**, пока
+`status === "active"`.
+
+Ответ:
+```json
+{
+  "id": "string",
+  "player1_id": "string",
+  "player2_id": "string",
+  "roadmap_id": "string",
+  "status": "active" | "finished",
+  "total_rounds": 3,
+  "current_round": 0,
+  "current_question": {
+    "id": "string",
+    "text": "string",
+    "options": ["string", "string", "string", "string"]
+  } | null,
+  "answer_deadline": "2026-08-13T12:00:15Z" | null,
+  "you_answered_current": false,
+  "opponent_answered_current": false,
+  "rounds": [
+    {
+      "question_id": "string",
+      "correct_option_index": 2,
+      "player1_selected_index": 1,
+      "player1_correct": false,
+      "player2_selected_index": 2,
+      "player2_correct": true
+    }
+  ]
+}
+```
+
+`answer_deadline` — ISO-таймстамп, когда истекает время на ответ по текущему
+раунду. Считается сервером как `момент_вскрытия_прошлого_раунда + 3 сек (пауза
+на реавил) + 15 сек (время на ответ)` — то есть таймер уже учитывает паузу на
+показ предыдущего ответа, фронту ничего вычитать/добавлять не нужно, просто
+`deadline - Date.now()`. Опрос `GET` остаётся раз в 1.5-2 сек, таймер между
+опросами тикает на клиенте локально.
+
+Если игрок не успел ответить до дедлайна — при следующем `GET` (своём или
+оппонента) сервер автоматически защитывает ему пустой/неверный ответ
+(`selected_option_index: -1`, `correct: false`), и раунд продолжается как
+обычно. Фронт увидит это как обычный вскрытый раунд в `rounds[]` — с точки
+зрения UI ничего специального обрабатывать не нужно, кроме самого таймера.
+
+Важно:
+- `current_question` вопрос текущего, ещё не вскрытого раунда. Правильный ответ
+  на него **не приходит**, пока не ответят оба игрока — доставать его неоткуда,
+  бэк намеренно скрывает `correct_option_index` до вскрытия.
+- Раунд появляется в `rounds[]` только когда **оба** игрока ответили (либо
+  реально, либо автоматическим промахом по таймауту). До этого момента
+  `you_answered_current`/`opponent_answered_current` показывают кто уже
+  ответил, но результат не раскрыт.
+- Когда все раунды вскрыты: `current_round === total_rounds`,
+  `current_question === null`, `answer_deadline === null`,
+  `rounds.length === total_rounds`. Это сигнал звать
+  `POST /matches/{id}/finish`.
+- Кто из `player1`/`player2` — это ты, определяется сравнением с `user_id` из
+  своего профиля (`useAuth`).
+
+### `POST /matches/{match_id}/answer`
+
+Запрос:
+```json
+{ "question_id": "string", "selected_option_index": 0 }
+```
+
+Отправлять **только** для `current_question.id` из последнего `GET`. Ответ:
+```json
+{ "status": "accepted" }
+```
+
+Ошибки:
+- `409 match_not_active`
+- `400 question_not_in_match`
+- `409 not_current_round` — пытаешься ответить не на текущий раунд (рассинхрон
+  с сервером — просто перезапроси `GET /matches/{id}` и обнови стейт)
+- `409 all_rounds_completed`
+- `422 selected_option_index_out_of_range`
+- `409 question_already_answered` — повторный ответ на тот же вопрос (защита от
+  дабл-клика/дабл-запроса)
+
+После успешного `answer` сразу продолжай поллинг `GET /matches/{id}` —
+свежий статус подтвердит `you_answered_current: true`.
+
+### `POST /matches/{match_id}/finish`
+
+Вызывать когда `current_question === null` (все раунды вскрыты). Идемпотентен —
+можно звать несколько раз (например если оба клиента вызовут одновременно),
+вернёт тот же сохранённый результат.
+
+Ответ:
+```json
+{
+  "player1_score": 2,
+  "player2_score": 1,
+  "player1_base_points": 20,
+  "player2_base_points": 10,
+  "player1_streak_multiplier": 1.3,
+  "player2_streak_multiplier": 1.1,
+  "player1_win_multiplier": 1.5,
+  "player2_win_multiplier": 1.0,
+  "player1_points_earned": 39,
+  "player2_points_earned": 11
+}
+```
+
+`score` — число правильных ответов из `total_rounds`. `points_earned = round(base_points * streak_multiplier * win_multiplier)`.
+
+## Экраны / состояния UI
+
+### 1. Выбор роадмапы (`RoadmapPicker`)
+
+- При открытии экрана боёв — `GET /matches/roadmaps`.
+- Рендерим список: доступные (`eligible: true`) кликабельны, недоступные —
+  задизейблены с подписью прогресса (`completed_units`/5).
+- Клик по доступной роадмапе → переход к поиску соперника с этим `roadmap_id`.
+
+### 2. Поиск соперника (`Matchmaking`)
+
+- `POST /matches/find` с выбранным `roadmap_id`.
+- Если `waiting` — показать спиннер "Ищем соперника...", повторять
+  `POST /matches/find` с тем же `roadmap_id` каждые несколько секунд, пока не
+  придёт `matched` (либо завести отдельный польный статус на бэке — уточнить,
+  если нужно; сейчас `find` вызывается повторно так же, как первый раз).
+- Если `matched` — сохранить `match_id`, перейти на экран матча.
+
+### 3. Экран раунда (`MatchRound`)
+
+Показывается пока `current_question !== null`.
+
+- Рендерим `current_question.text` и `current_question.options`.
+- Обратный отсчёт: `secondsLeft = Math.max(0, (new Date(answer_deadline) - Date.now()) / 1000)`,
+  обновлять `setInterval` каждую секунду локально — сервер не дёргаем чаще, чем
+  обычный поллинг раунда.
+- Если `you_answered_current === false` — варианты кликабельны, выбор шлёт
+  `POST /matches/{id}/answer`.
+- Сразу после отправки — варианты блокируются (не дожидаясь ответа сервера,
+  оптимистично), показать "Ждём соперника..." если
+  `opponent_answered_current === false`.
+- Если таймер дошёл до нуля, а ты не успел ответить — ничего специально
+  делать не нужно, просто продолжай поллинг: сервер сам защитает промах при
+  следующем `GET`, и раунд появится в `rounds[]` как обычно (с твоим
+  `selected_index: -1`).
+- Продолжать поллинг `GET /matches/{id}` в фоне.
+
+### 4. Реавил раунда (`RoundReveal`)
+
+Как только `rounds.length` увеличился по сравнению с прошлым состоянием — новый
+раунд появился в конце массива. Показать его на 2-3 секунды перед тем как
+переключиться на следующий `current_question`:
+
+- Подсветка вариантов **по индексам, а не по тексту**:
+  - `optionIndex === round.correct_option_index` → зелёный
+  - `optionIndex === myScore(round)` (свой `selected_index`) и это не
+    `correct_option_index` → красный
+  - остальные — нейтральный
+- Показать "Верно! / Неверно" для себя и опционально для соперника.
+- Прогресс-бар/индикатор раунда: `current_round из total_rounds` (после
+  вскрытия `current_round` уже указывает на следующий).
+
+Реализация переключения между "вопрос" и "реавил" — чисто на фронте: как
+только видим, что `rounds` пополнился, показываем реавил-оверлей на N секунд
+локальным таймером, потом рендерим новый `current_question`. Сервер не нужно
+дёргать чаще для этого перехода — все данные уже есть в последнем `GET`.
+
+### 5. Финальный экран (`MatchResult`)
+
+Показывается когда `current_question === null` и вызван `finish`:
+
+- `player1_score` vs `player2_score` — кто выиграл (кто больше)
+- Разбивка очков для себя: `base_points → × streak_multiplier → × win_multiplier → points_earned`
+- Кнопка "Играть снова" → назад на экран выбора роадмапы (`Matchmaking`)
+
+## Пример состояния на фронте (React, набросок)
+
+```typescript
+interface MatchState {
+  id: string;
+  status: 'active' | 'finished';
+  totalRounds: number;
+  currentRound: number;
+  currentQuestion: Question | null;
+  youAnswered: boolean;
+  opponentAnswered: boolean;
+  rounds: RoundResult[];
+}
+
+// poll loop
+useEffect(() => {
+  if (!matchId) return;
+  const poll = setInterval(async () => {
+    const data = await getMatchApi(matchId);
+    setMatch(data);
+    if (data.current_question === null && data.status === 'active') {
+      const result = await finishMatchApi(matchId);
+      setResult(result);
+      clearInterval(poll);
+    }
+  }, 1500);
+  return () => clearInterval(poll);
+}, [matchId]);
+
+// показываем reveal когда rounds пополнился
+useEffect(() => {
+  if (!match) return;
+  if (match.rounds.length > lastRoundsCount) {
+    setShowingReveal(true);
+    const t = setTimeout(() => setShowingReveal(false), 2500);
+    setLastRoundsCount(match.rounds.length);
+    return () => clearTimeout(t);
+  }
+}, [match?.rounds.length]);
+```
+
+## Известные ограничения (можно доделать позже)
+
+- Нет отдельного статуса ожидания в очереди (`waiting`) с поллингом — сейчас
+  фронт должен сам повторять `POST /matches/find`, чтобы понять, нашёлся ли
+  соперник.

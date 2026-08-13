@@ -1,0 +1,25 @@
+UI Rework
+
+Change the name of the website to EduComp
+
+The visual theme for this website is bright and clean, with dashes of color
+Make the backgrounds a bright, slightly colder white, the accents should be bright white with a slight lime tinge.
+
+In tests and pvp, upon answering correctly, the incorrect answers should have get a tinge of red (just a slight hue, not saturated), and the correct one should be bright lime-ish green.
+In tests and pvp, upon answering incorrectly, your answer should be highlighted in bright red with a pink-ish hue, the other incorrect answers should be slightly red as in the other case, and the correct answer should be a bright green.
+
+Home page
+Rename the Dashboard to Home
+delete the following tiles: Knowledge points, Units completed and the small 1v1 pvp matchmaking, while retaining the others, and keeping the big Matchmaking gate tile.
+change the colors according to the visual theme described earlier
+
+Navbar
+remove the points from the navbar
+remove the unit completion status from the navbar
+center the page selection buttons
+adjust te colors to fit the visual scheme
+
+Roadmaps page
+remove the endpoint text from the page
+Change the passing grade in the ui to 75%
+adjust colors according to the visual theme
